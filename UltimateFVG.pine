@@ -1,0 +1,308 @@
+//@version=6
+// =============================================================================
+// Ultimate Fair Value Gap (FVG) Indicator
+// -----------------------------------------------------------------------------
+// Detects 3-candle Fair Value Gaps and scores each one by institutional
+// confluences, then only draws gaps that meet a minimum score so the chart
+// stays clean. Mitigation state drives both color and score.
+//
+// Scoring factors (configurable weights):
+//   - Daily bias alignment       (prior daily close vs prior-day midpoint)
+//   - Formed in an Order Block / Breaker Block
+//   - Formed after a liquidity sweep of a key level (PDH/PDL/PWH/PWL/swing)
+//   - Displacement strength       (gap-forming candle vs ATR)
+//   - Gap size                    (gap height vs ATR)
+//
+// Mitigation handling:
+//   - Unmitigated         -> full color
+//   - Partially mitigated -> dimmed, remaining zone redrawn
+//   - Fully mitigated      -> muted "tested" color, score reduced, optional hide
+// =============================================================================
+indicator("Ultimate Fair Value Gap", shorttitle="Ult FVG", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ========================= INPUTS ============================================
+grpF = "FVG Detection"
+useChartTF      = input.bool(true,  "Detect FVGs on chart timeframe", group=grpF)
+minGapAtrMult   = input.float(0.10, "Min gap size (× ATR)", minval=0.0, step=0.05, group=grpF, tooltip="Gaps smaller than this fraction of ATR are ignored as noise.")
+maxActive       = input.int(20,     "Max FVGs tracked", minval=1, maxval=200, group=grpF, tooltip="Oldest gaps are recycled once the limit is hit.")
+extendRight     = input.bool(true,  "Extend boxes to the right", group=grpF)
+atrLen          = input.int(14,     "ATR length", minval=1, group=grpF)
+
+grpScore = "Scoring Engine"
+minScore        = input.int(50,     "Minimum score to draw (0-100)", minval=0, maxval=100, group=grpScore, tooltip="Only gaps scoring at least this are shown. Raise it to de-clutter.")
+wBias           = input.int(25,     "Weight: Daily bias alignment", minval=0, maxval=100, group=grpScore)
+wOB             = input.int(20,     "Weight: Order/Breaker block origin", minval=0, maxval=100, group=grpScore)
+wSweep          = input.int(25,     "Weight: Liquidity sweep before gap", minval=0, maxval=100, group=grpScore)
+wDisp           = input.int(15,     "Weight: Displacement strength", minval=0, maxval=100, group=grpScore)
+wSize           = input.int(15,     "Weight: Gap size", minval=0, maxval=100, group=grpScore)
+mitPenalty      = input.int(30,     "Score penalty when fully mitigated", minval=0, maxval=100, group=grpScore)
+dispAtrMult     = input.float(1.0,  "Displacement = candle range ≥ (× ATR)", minval=0.1, step=0.1, group=grpScore)
+sizeFullAtr     = input.float(0.5,  "Gap size for full size-score (× ATR)", minval=0.1, step=0.1, group=grpScore)
+
+grpStruct = "Structure (OB / Sweep)"
+swingLen        = input.int(10,     "Swing lookback (pivots)", minval=2, group=grpStruct, tooltip="Used to find swing highs/lows for order blocks and sweeps.")
+sweepLookback   = input.int(5,      "Sweep window (bars before gap)", minval=1, maxval=50, group=grpStruct)
+
+grpMit = "Mitigation & Display"
+hideMitigated   = input.bool(false, "Hide fully mitigated gaps", group=grpMit)
+showScore       = input.bool(true,  "Show score label on box", group=grpMit)
+showGrade       = input.bool(true,  "Show letter grade (A/B/C)", group=grpMit)
+showDash        = input.bool(true,  "Show dashboard (top-right)", group=grpMit)
+showKeyLevels   = input.bool(true,  "Plot PDH/PDL/PWH/PWL", group=grpMit)
+
+grpColor = "Colors"
+colBull     = input.color(color.new(#26a69a, 70), "Bullish FVG", group=grpColor)
+colBear     = input.color(color.new(#ef5350, 70), "Bearish FVG", group=grpColor)
+colPartial  = input.color(color.new(#ffb74d, 60), "Partially mitigated", group=grpColor)
+colTested   = input.color(color.new(#9e9e9e, 80), "Fully mitigated (tested)", group=grpColor)
+colText     = input.color(color.white, "Label text", group=grpColor)
+
+// ========================= HTF DATA (DAILY / WEEKLY) =========================
+// Previous day/week high/low/close via confirmed-bar security requests.
+pdh = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+pdc = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+pdo = request.security(syminfo.tickerid, "D", open[1],  lookahead=barmerge.lookahead_on)
+pwh = request.security(syminfo.tickerid, "W", high[1],  lookahead=barmerge.lookahead_on)
+pwl = request.security(syminfo.tickerid, "W", low[1],   lookahead=barmerge.lookahead_on)
+
+// Daily bias: prior daily close relative to prior-day midpoint.
+// Close in upper half of prior range => bullish lean, lower half => bearish.
+pdMid    = (pdh + pdl) / 2.0
+biasBull = pdc > pdMid
+biasBear = pdc < pdMid
+
+atr = ta.atr(atrLen)
+
+// ========================= STRUCTURE: PIVOTS / OB ============================
+ph = ta.pivothigh(swingLen, swingLen)
+pl = ta.pivotlow(swingLen, swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+// Simple order-block proxy: the last opposite-color candle immediately before a
+// displacement move. We approximate "formed in an OB/BB" by checking whether the
+// candle before the gap-forming candle was an opposite-direction candle that was
+// then engulfed/displaced (classic last-down-before-up / last-up-before-down).
+isBullDisp = close > open and (high - low) >= atr * dispAtrMult
+isBearDisp = close < open and (high - low) >= atr * dispAtrMult
+
+// ========================= FVG TYPE (UDT) ====================================
+type FVG
+    box    bx
+    label  lbl
+    line   midLn
+    float  top
+    float  bot
+    float  origTop
+    float  origBot
+    bool   bull
+    int    score
+    int    createdBar
+    int    state      // 0 = unmitigated, 1 = partial, 2 = fully mitigated
+    bool   alive
+
+var array<FVG> fvgs = array.new<FVG>()
+
+// ========================= HELPERS ===========================================
+grade(int s) =>
+    s >= 85 ? "A+" : s >= 75 ? "A" : s >= 65 ? "B" : s >= 55 ? "C" : "D"
+
+labelTxt(FVG f) =>
+    txt = ""
+    if showGrade
+        txt := grade(f.score)
+    if showScore
+        txt := txt + (txt == "" ? "" : " ") + str.tostring(f.score)
+    f.state == 2 ? txt + " ·tested" : f.state == 1 ? txt + " ·partial" : txt
+
+colorFor(FVG f) =>
+    f.state == 2 ? colTested : f.state == 1 ? colPartial : (f.bull ? colBull : colBear)
+
+// Was a key level swept within the sweep window ending at the gap-forming candle?
+// A sweep = wick pierced the level but body/close returned back through it.
+sweptKeyLevel(bool bull) =>
+    bool found = false
+    for i = 1 to sweepLookback
+        hi = high[i]
+        lo = low[i]
+        cl = close[i]
+        if bull
+            // bullish gap often follows a sweep of a low (PDL/PWL/swing low)
+            if (not na(pdl) and lo < pdl and cl > pdl) or (not na(pwl) and lo < pwl and cl > pwl) or (not na(lastSwingLow) and lo < lastSwingLow and cl > lastSwingLow)
+                found := true
+        else
+            if (not na(pdh) and hi > pdh and cl < pdh) or (not na(pwh) and hi > pwh and cl < pwh) or (not na(lastSwingHigh) and hi > lastSwingHigh and cl < lastSwingHigh)
+                found := true
+    found
+
+// Order/breaker block origin proxy: opposite-color candle right before the
+// displacement candle that created the gap (c1 is the middle/displacement bar).
+obOrigin(bool bull) =>
+    bull ? (close[2] < open[2]) : (close[2] > open[2])
+
+// ========================= FVG DETECTION =====================================
+// Classic 3-candle FVG measured on bars [2],[1],[0] -> gap defined by bar2 & bar0.
+// Bullish:  low[0] > high[2]   (gap between high of 1st candle and low of 3rd)
+// Bearish:  high[0] < low[2]
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+gapTopBull = low
+gapBotBull = high[2]
+gapTopBear = low[2]
+gapBotBear = high
+
+newBull = bullFVG and (gapTopBull - gapBotBull) >= atr * minGapAtrMult
+newBear = bearFVG and (gapTopBear - gapBotBear) >= atr * minGapAtrMult
+
+computeScore(bool bull, float gapTop, float gapBot) =>
+    int s = 0
+    // Bias alignment
+    if (bull and biasBull) or (not bull and biasBear)
+        s := s + wBias
+    // Order/Breaker block origin
+    if obOrigin(bull)
+        s := s + wOB
+    // Liquidity sweep
+    if sweptKeyLevel(bull)
+        s := s + wSweep
+    // Displacement strength (the middle displacement bar is [1])
+    dispRange = high[1] - low[1]
+    if dispRange >= atr * dispAtrMult
+        s := s + wDisp
+    else
+        s := s + int(wDisp * math.min(1.0, dispRange / (atr * dispAtrMult)))
+    // Gap size
+    gh = gapTop - gapBot
+    sizeFrac = math.min(1.0, gh / (atr * sizeFullAtr))
+    s := s + int(wSize * sizeFrac)
+    math.min(100, s)
+
+makeFVG(bool bull, float gapTop, float gapBot) =>
+    int sc = computeScore(bull, gapTop, gapBot)
+    if sc >= minScore
+        col = bull ? colBull : colBear
+        bx = box.new(bar_index - 1, gapTop, bar_index + (extendRight ? 0 : 0), gapBot, border_color=col, bgcolor=col, extend=extendRight ? extend.right : extend.none)
+        ln = line.new(bar_index - 1, (gapTop + gapBot) / 2.0, bar_index, (gapTop + gapBot) / 2.0, color=color.new(col, 20), style=line.style_dotted, extend=extendRight ? extend.right : extend.none)
+        lb = (showScore or showGrade) ? label.new(bar_index - 1, gapTop, "", style=bull ? label.style_label_down : label.style_label_up, color=color.new(chart.bg_color, 100), textcolor=colText, size=size.small) : na
+        FVG f = FVG.new(bx, lb, ln, gapTop, gapBot, gapTop, gapBot, bull, sc, bar_index, 0, true)
+        if not na(lb)
+            label.set_text(lb, labelTxt(f))
+        array.push(fvgs, f)
+        // Recycle oldest if over capacity
+        if array.size(fvgs) > maxActive
+            FVG old = array.shift(fvgs)
+            box.delete(old.bx)
+            line.delete(old.midLn)
+            if not na(old.lbl)
+                label.delete(old.lbl)
+
+if barstate.isconfirmed
+    if newBull
+        makeFVG(true, gapTopBull, gapBotBull)
+    if newBear
+        makeFVG(false, gapTopBear, gapBotBear)
+
+// ========================= MITIGATION UPDATE =================================
+// Walk active gaps and update state based on current price interaction.
+if barstate.isconfirmed and array.size(fvgs) > 0
+    for i = array.size(fvgs) - 1 to 0
+        FVG f = array.get(fvgs, i)
+        if not f.alive
+            continue
+        mid = (f.origTop + f.origBot) / 2.0
+        if f.bull
+            // price trades down into the gap
+            if low <= f.origBot
+                // fully filled through the bottom
+                f.state := 2
+            else if low <= mid and f.state < 2
+                f.state := 1
+                f.bot := low            // shrink remaining zone up to the fill
+            else if low < f.origTop and f.state < 1
+                f.state := 1
+                f.bot := low
+        else
+            if high >= f.origTop
+                f.state := 2
+            else if high >= mid and f.state < 2
+                f.state := 1
+                f.top := high
+            else if high > f.origBot and f.state < 1
+                f.state := 1
+                f.top := high
+
+        // Apply visuals
+        if f.state == 2 and hideMitigated
+            box.delete(f.bx)
+            line.delete(f.midLn)
+            if not na(f.lbl)
+                label.delete(f.lbl)
+            f.alive := false
+            array.remove(fvgs, i)
+            continue
+
+        col = colorFor(f)
+        box.set_bgcolor(f.bx, col)
+        box.set_border_color(f.bx, col)
+        box.set_top(f.bx, f.top)
+        box.set_bottom(f.bx, f.bot)
+        // stop extending once fully mitigated
+        if f.state == 2
+            box.set_extend(f.bx, extend.none)
+            box.set_right(f.bx, bar_index)
+            line.set_extend(f.midLn, extend.none)
+            line.set_x2(f.midLn, bar_index)
+
+        // Score reflects mitigation (fully mitigated -> penalty)
+        effScore = f.state == 2 ? math.max(0, f.score - mitPenalty) : f.score
+        if not na(f.lbl)
+            // rebuild label text using effective score
+            gr = showGrade ? grade(effScore) : ""
+            sc = showScore ? str.tostring(effScore) : ""
+            tail = f.state == 2 ? " ·tested" : f.state == 1 ? " ·partial" : ""
+            label.set_text(f.lbl, (gr + (gr != "" and sc != "" ? " " : "") + sc) + tail)
+            label.set_textcolor(f.lbl, colText)
+            label.set_x(f.lbl, bar_index)
+            label.set_y(f.lbl, f.bull ? f.top : f.bot)
+        array.set(fvgs, i, f)
+
+// ========================= KEY LEVELS ========================================
+plot(showKeyLevels ? pdh : na, "PDH", color=color.new(color.red, 30),   style=plot.style_linebr, linewidth=1)
+plot(showKeyLevels ? pdl : na, "PDL", color=color.new(color.green, 30), style=plot.style_linebr, linewidth=1)
+plot(showKeyLevels ? pwh : na, "PWH", color=color.new(color.red, 60),   style=plot.style_linebr, linewidth=1)
+plot(showKeyLevels ? pwl : na, "PWL", color=color.new(color.green, 60), style=plot.style_linebr, linewidth=1)
+
+// ========================= DASHBOARD =========================================
+var table dash = table.new(position.top_right, 2, 5, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+if showDash and barstate.islast
+    biasTxt = biasBull ? "Bullish" : biasBear ? "Bearish" : "Neutral"
+    biasCol = biasBull ? color.new(color.green, 0) : biasBear ? color.new(color.red, 0) : color.new(color.gray, 0)
+    int activeCount = 0
+    int aGrade = 0
+    for i = 0 to array.size(fvgs) - 1
+        FVG f = array.get(fvgs, i)
+        if f.alive and f.state < 2
+            activeCount := activeCount + 1
+            if f.score >= 75
+                aGrade := aGrade + 1
+    table.cell(dash, 0, 0, "Ultimate FVG", text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small)
+    table.cell(dash, 1, 0, "", bgcolor=color.new(color.blue, 20))
+    table.cell(dash, 0, 1, "Daily Bias", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, biasTxt, text_color=color.white, bgcolor=biasCol, text_size=size.small)
+    table.cell(dash, 0, 2, "Active FVGs", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(activeCount), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "A-grade active", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(aGrade), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 4, "Min score", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(minScore), text_color=color.white, text_size=size.small)
+
+// ========================= ALERTS ============================================
+alertcondition(newBull, "New Bullish FVG", "A new bullish Fair Value Gap formed")
+alertcondition(newBear, "New Bearish FVG", "A new bearish Fair Value Gap formed")
