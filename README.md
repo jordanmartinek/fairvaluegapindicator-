@@ -12,9 +12,18 @@ Most FVG indicators draw every gap and clutter the chart. This one treats each g
 
 Gaps must come from a real **displacement candle**, not just any 3-bar gap:
 
-- The middle (gap-forming) candle must be a strong directional move — its range ≥ a configurable ATR multiple **and** its body dominates the range (configurable body ratio) **and** it closes in the gap's direction. This filters weak/noise gaps. (Toggleable.)
+- The middle (gap-forming) candle must be a strong directional move — its range ≥ a configurable ATR multiple, its body dominates the range (configurable body ratio), **and it closes near its extreme** (configurable close-position threshold) so weak, indecisive candles are rejected. (Toggleable.)
 - A **minimum gap size** (× ATR) filter removes tiny imbalances.
+- **Consolidation guard** rejects gaps born inside compressed, low-expansion price action (usually noise) by requiring the 3 forming bars to show real range expansion vs. ATR.
 - **Nested-gap de-duplication** skips a new gap that is almost entirely contained within an existing live gap, so overlapping zones don't stack up.
+
+### Market Structure Shift (MSS)
+
+Swing-pivot tracking detects a **BOS/CHoCH** — a confirmed close beyond the most recent swing high/low. A gap formed with structure breaking in its direction scores higher, which is the proper context behind order-block/breaker setups. Current structure state is shown on the dashboard.
+
+### Relevance decay
+
+Old, unmitigated gaps that price has drifted far away from **lose score over time** (configurable max penalty, age window, and distance sensitivity), so the hierarchy always reflects what's actionable *now* rather than stale zones.
 
 ### Scoring engine (0–100)
 
@@ -22,16 +31,27 @@ Each gap earns points from configurable factors:
 
 | Factor | What it checks | Default weight |
 |---|---|---|
-| **Daily bias alignment** | Prior daily close vs. prior-day midpoint. Bullish FVG in bullish bias (and vice versa) scores. | 22 |
-| **Order / Breaker block origin** | The gap-forming displacement came out of an opposite-color candle (last-down-before-up / last-up-before-down). | 18 |
-| **Liquidity sweep** | A key level (PDH, PDL, PWH, PWL, or recent swing) was swept just before the gap formed (wick pierces, close returns). | 22 |
-| **Displacement strength** | The displacement candle's range vs. ATR (scaled). | 15 |
+| **Daily bias alignment** | Prior daily close vs. prior-day midpoint. Bullish FVG in bullish bias (and vice versa) scores. | 18 |
+| **Market Structure Shift** | BOS/CHoCH broke in the gap's direction. | 16 |
+| **Order / Breaker block origin** | The gap-forming displacement came out of an opposite-color candle (last-down-before-up / last-up-before-down). | 14 |
+| **Liquidity sweep** | A key level (PDH, PDL, PWH, PWL, or recent swing) was swept in the window **immediately before** the displacement (wick pierces, close returns). | 18 |
+| **Displacement strength** | The displacement candle's range vs. ATR (scaled). | 14 |
 | **Displacement volume** | Displacement candle volume vs. its moving average. | 10 |
-| **Gap size** | Gap height vs. ATR (filters tiny noise gaps). | 13 |
+| **Gap size** | Gap height vs. ATR (filters tiny noise gaps). | 10 |
 
 Only gaps scoring **≥ Minimum score** (default 50) are drawn. Raise the threshold to show only the highest-conviction gaps.
 
-Each box shows a **letter grade** (A+/A/B/C/D) and/or the numeric score.
+### Clear visual hierarchy (redesigned labelling)
+
+The old crowded `A 82 ·tested` labels are gone. The hierarchy is now conveyed primarily by **how the box looks**, with short, optional text:
+
+- **Tier visuals** — stronger gaps render **more opaque with a heavier border**; weaker gaps fade back. The strongest gaps literally pop off the chart, so you read the hierarchy at a glance without reading any numbers.
+- **One clean grade token** — a single letter grade (`A+`/`A`/`B`/`C`/`D`), never grade *and* raw number mashed together.
+- **State as an icon**, not words: `✦` fresh · `◐` partial · `✓` tested · `⇄` inverted.
+- **Confluence tags on A-grade only** — top-tier gaps optionally show *why* they scored (`bias sweep MSS OB`); lower gaps stay clean.
+- **Label-style options**: `Grade only`, `Grade + state icon` (default), `Grade + score`, `Minimal tag` (a solid colored grade chip — cleanest), or `None`.
+- **Grade filter for labels** — e.g. only label gaps grade ≥ B, so weak boxes draw silently without text.
+- Configurable label **size** (Tiny/Small/Normal).
 
 ### Mitigation = color + score
 

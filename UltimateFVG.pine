@@ -2,17 +2,21 @@
 // =============================================================================
 // Ultimate Fair Value Gap (FVG) Indicator
 // -----------------------------------------------------------------------------
-// Detects 3-candle Fair Value Gaps created by a displacement candle, scores each
-// one by institutional confluence, and only draws gaps that meet a minimum score
-// so the chart stays clean. Mitigation state drives both color and score.
+// Detects high-quality 3-candle Fair Value Gaps created by a true displacement
+// candle, scores each by institutional confluence, and only draws gaps that meet
+// a minimum score. Visual hierarchy (opacity, border, label) mirrors the score
+// so the strongest gaps stand out instantly. Mitigation drives color and score.
 //
 // Scoring factors (configurable weights):
 //   - Daily bias alignment       (prior daily close vs prior-day midpoint)
-//   - Formed in an Order Block / Breaker Block
-//   - Formed after a liquidity sweep of a key level (PDH/PDL/PWH/PWL/swing)
-//   - Displacement strength       (gap-forming candle vs ATR)
+//   - Market Structure Shift      (BOS / CHoCH in the gap's direction)
+//   - Order / Breaker block origin
+//   - Liquidity sweep             (recent, immediately preceding the displacement)
+//   - Displacement strength       (range vs ATR + strong directional close)
 //   - Displacement volume          (volume vs its moving average)
 //   - Gap size                    (gap height vs ATR)
+// Minus:
+//   - Relevance decay              (old, far-away unmitigated gaps fade)
 //
 // Mitigation handling:
 //   - Unmitigated         -> full color
@@ -25,6 +29,8 @@ indicator("Ultimate Fair Value Gap", shorttitle="Ult FVG", overlay=true, max_box
 grpF = "FVG Detection"
 requireDisplacement = input.bool(true, "Require displacement candle", group=grpF, tooltip="Only flag gaps whose middle (gap-forming) candle is a strong directional move. Filters weak/noise gaps.")
 minGapAtrMult   = input.float(0.10, "Min gap size (× ATR)", minval=0.0, step=0.05, group=grpF, tooltip="Gaps smaller than this fraction of ATR are ignored as noise.")
+rejectConsolid  = input.bool(true,  "Reject gaps born in consolidation", group=grpF, tooltip="Skip gaps where recent price range is compressed (low expansion) — usually noise.")
+consolAtrMult   = input.float(1.5,  "Consolidation = 3-bar range < (× ATR)", minval=0.1, step=0.1, group=grpF)
 dedupeOverlap   = input.bool(true,  "Skip gaps nested inside a live gap", group=grpF, tooltip="Avoids drawing a new gap that is almost entirely contained within an existing active gap.")
 maxActive       = input.int(20,     "Max FVGs tracked", minval=1, maxval=200, group=grpF, tooltip="Oldest gaps are recycled once the limit is hit.")
 extendRight     = input.bool(true,  "Extend boxes to the right", group=grpF)
@@ -32,48 +38,56 @@ atrLen          = input.int(14,     "ATR length", minval=1, group=grpF)
 
 grpScore = "Scoring Engine"
 minScore        = input.int(50,     "Minimum score to draw (0-100)", minval=0, maxval=100, group=grpScore, tooltip="Only gaps scoring at least this are shown. Raise it to de-clutter.")
-wBias           = input.int(22,     "Weight: Daily bias alignment", minval=0, maxval=100, group=grpScore)
-wOB             = input.int(18,     "Weight: Order/Breaker block origin", minval=0, maxval=100, group=grpScore)
-wSweep          = input.int(22,     "Weight: Liquidity sweep before gap", minval=0, maxval=100, group=grpScore)
-wDisp           = input.int(15,     "Weight: Displacement strength", minval=0, maxval=100, group=grpScore)
+wBias           = input.int(18,     "Weight: Daily bias alignment", minval=0, maxval=100, group=grpScore)
+wMSS            = input.int(16,     "Weight: Market Structure Shift", minval=0, maxval=100, group=grpScore)
+wOB             = input.int(14,     "Weight: Order/Breaker block origin", minval=0, maxval=100, group=grpScore)
+wSweep          = input.int(18,     "Weight: Liquidity sweep before gap", minval=0, maxval=100, group=grpScore)
+wDisp           = input.int(14,     "Weight: Displacement strength", minval=0, maxval=100, group=grpScore)
 wVol            = input.int(10,     "Weight: Displacement volume", minval=0, maxval=100, group=grpScore)
-wSize           = input.int(13,     "Weight: Gap size", minval=0, maxval=100, group=grpScore)
+wSize           = input.int(10,     "Weight: Gap size", minval=0, maxval=100, group=grpScore)
 mitPenalty      = input.int(30,     "Score penalty when fully mitigated", minval=0, maxval=100, group=grpScore)
+decayEnable     = input.bool(true,  "Relevance decay (old/far gaps fade)", group=grpScore)
+decayMaxPts     = input.int(15,     "Max decay penalty (pts)", minval=0, maxval=50, group=grpScore)
+decayBars       = input.int(150,    "Bars until full age decay", minval=10, group=grpScore)
 dispAtrMult     = input.float(1.2,  "Displacement = candle range ≥ (× ATR)", minval=0.1, step=0.1, group=grpScore)
 dispBodyPct     = input.float(0.55, "Displacement min body ratio", minval=0.1, maxval=1.0, step=0.05, group=grpScore, tooltip="Body / range of the displacement candle. Higher = stronger conviction required.")
+dispClosePct    = input.float(0.65, "Displacement min close position", minval=0.5, maxval=1.0, step=0.05, group=grpScore, tooltip="How close the displacement candle must close to its extreme (1.0 = at the high/low). Enforces a strong directional close.")
 sizeFullAtr     = input.float(0.5,  "Gap size for full size-score (× ATR)", minval=0.1, step=0.1, group=grpScore)
 volMaLen        = input.int(20,     "Volume MA length", minval=1, group=grpScore)
 
-grpStruct = "Structure (OB / Sweep)"
-swingLen        = input.int(10,     "Swing lookback (pivots)", minval=2, group=grpStruct, tooltip="Used to find swing highs/lows for order blocks and sweeps.")
-sweepLookback   = input.int(5,      "Sweep window (bars before gap)", minval=1, maxval=50, group=grpStruct)
+grpStruct = "Structure (MSS / OB / Sweep)"
+swingLen        = input.int(10,     "Swing lookback (pivots)", minval=2, group=grpStruct, tooltip="Used to find swing highs/lows for MSS, order blocks and sweeps.")
+sweepLookback   = input.int(3,      "Sweep window (bars before displacement)", minval=1, maxval=20, group=grpStruct, tooltip="Sweep must occur within this many bars immediately before the displacement candle.")
 
 grpMit = "Mitigation & Display"
 mitThreshold    = input.string("Full fill", "Mitigation threshold", options=["Full fill", "Midpoint (CE)"], group=grpMit, tooltip="When is a gap considered fully mitigated: price fully fills it, or price reaches the 50% Consequent Encroachment level.")
 hideMitigated   = input.bool(false, "Hide fully mitigated gaps", group=grpMit)
 showInversion   = input.bool(true,  "Mark Inverted FVGs (IFVG) when traded through", group=grpMit, tooltip="A fully traded-through gap flips polarity and is kept as support/resistance instead of greyed out.")
-showScore       = input.bool(true,  "Show score label on box", group=grpMit)
-showGrade       = input.bool(true,  "Show letter grade (A/B/C)", group=grpMit)
-showDash        = input.bool(true,  "Show dashboard (top-right)", group=grpMit)
-showKeyLevels   = input.bool(true,  "Plot PDH/PDL/PWH/PWL", group=grpMit)
+
+grpLbl = "Labelling"
+labelMode       = input.string("Grade + state icon", "Label style", options=["Grade only", "Grade + state icon", "Grade + score", "Minimal tag", "None"], group=grpLbl, tooltip="Controls how much text each gap shows. 'Minimal tag' is cleanest.")
+tierVisuals     = input.bool(true,  "Tier visuals (stronger gaps = bolder)", group=grpLbl, tooltip="A-grade gaps get a more opaque fill and heavier border; weaker gaps fade back. Makes hierarchy obvious.")
+showConfluence  = input.bool(true,  "Show confluence tags on A-grade only", group=grpLbl, tooltip="Top-tier gaps display why they scored (bias/sweep/MSS). Keeps lower gaps clean.")
+labelSize       = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=grpLbl)
+onlyGradeAtLeast= input.string("All", "Only label gaps grade ≥", options=["All", "C", "B", "A"], group=grpLbl, tooltip="Hide labels on lower-grade gaps to reduce clutter (boxes still draw).")
+showDash        = input.bool(true,  "Show dashboard (top-right)", group=grpLbl)
+showKeyLevels   = input.bool(true,  "Plot PDH/PDL/PWH/PWL", group=grpLbl)
 
 grpColor = "Colors"
-colBull     = input.color(color.new(#26a69a, 70), "Bullish FVG", group=grpColor)
-colBear     = input.color(color.new(#ef5350, 70), "Bearish FVG", group=grpColor)
-colPartial  = input.color(color.new(#ffb74d, 60), "Partially mitigated", group=grpColor)
-colTested   = input.color(color.new(#9e9e9e, 80), "Fully mitigated (tested)", group=grpColor)
-colInv      = input.color(color.new(#ab47bc, 65), "Inverted FVG (IFVG)", group=grpColor)
+colBullBase = input.color(#26a69a, "Bullish FVG", group=grpColor)
+colBearBase = input.color(#ef5350, "Bearish FVG", group=grpColor)
+colPartial  = input.color(color.new(#ffb74d, 55), "Partially mitigated", group=grpColor)
+colTested   = input.color(color.new(#9e9e9e, 82), "Fully mitigated (tested)", group=grpColor)
+colInv      = input.color(color.new(#ab47bc, 60), "Inverted FVG (IFVG)", group=grpColor)
 colText     = input.color(color.white, "Label text", group=grpColor)
 
 // ========================= HTF DATA (DAILY / WEEKLY) =========================
-// Previous day/week high/low/close via confirmed-bar security requests.
 pdh = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
 pdl = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
 pdc = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
 pwh = request.security(syminfo.tickerid, "W", high[1],  lookahead=barmerge.lookahead_on)
 pwl = request.security(syminfo.tickerid, "W", low[1],   lookahead=barmerge.lookahead_on)
 
-// Daily bias: prior daily close relative to prior-day midpoint.
 pdMid    = (pdh + pdl) / 2.0
 biasBull = pdc > pdMid
 biasBear = pdc < pdMid
@@ -81,16 +95,31 @@ biasBear = pdc < pdMid
 atr   = ta.atr(atrLen)
 volMa = ta.sma(volume, volMaLen)
 
-// ========================= STRUCTURE: PIVOTS ================================
+// ========================= STRUCTURE: PIVOTS & MSS ==========================
 ph = ta.pivothigh(swingLen, swingLen)
 pl = ta.pivotlow(swingLen, swingLen)
 
 var float lastSwingHigh = na
 var float lastSwingLow  = na
+var float prevSwingHigh = na
+var float prevSwingLow  = na
 if not na(ph)
+    prevSwingHigh := lastSwingHigh
     lastSwingHigh := ph
 if not na(pl)
+    prevSwingLow := lastSwingLow
     lastSwingLow := pl
+
+// Market Structure Shift: a confirmed close beyond the most recent swing.
+// Bullish MSS = close breaks above last swing high; bearish = below last swing low.
+var bool mssBull = false
+var bool mssBear = false
+if not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+    mssBull := true
+    mssBear := false
+if not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+    mssBear := true
+    mssBull := false
 
 // ========================= FVG TYPE (UDT) ====================================
 type FVG
@@ -100,12 +129,16 @@ type FVG
     float  bot
     float  origTop
     float  origBot
-    bool   bull        // original polarity
-    int    score
+    bool   bull
+    int    score        // base score at formation
     int    createdBar
-    int    state       // 0 = unmitigated, 1 = partial, 2 = fully mitigated/inverted
-    bool   inverted    // true once traded fully through and kept as IFVG
+    int    state        // 0 = unmitigated, 1 = partial, 2 = fully mitigated/inverted
+    bool   inverted
     bool   alive
+    bool   cBias
+    bool   cSweep
+    bool   cMSS
+    bool   cOB
 
 var array<FVG> fvgs = array.new<FVG>()
 
@@ -113,14 +146,57 @@ var array<FVG> fvgs = array.new<FVG>()
 grade(int s) =>
     s >= 85 ? "A+" : s >= 75 ? "A" : s >= 65 ? "B" : s >= 55 ? "C" : "D"
 
-colorFor(FVG f) =>
-    f.inverted ? colInv : f.state == 2 ? colTested : f.state == 1 ? colPartial : (f.bull ? colBull : colBear)
+gradeRank(string g) =>
+    g == "A+" ? 4 : g == "A" ? 3 : g == "B" ? 2 : g == "C" ? 1 : 0
 
-// Was a key level swept within the sweep window ending at the gap-forming candle?
-// A sweep = wick pierced the level but close returned back through it.
+minGradeRank = onlyGradeAtLeast == "A" ? 3 : onlyGradeAtLeast == "B" ? 2 : onlyGradeAtLeast == "C" ? 1 : 0
+
+lblSize = labelSize == "Tiny" ? size.tiny : labelSize == "Normal" ? size.normal : size.small
+
+// Tier -> fill transparency. Stronger gaps are more opaque (lower transparency).
+tierTransp(int s) =>
+    s >= 85 ? 60 : s >= 75 ? 68 : s >= 65 ? 76 : s >= 55 ? 84 : 88
+
+tierBorderW(int s) =>
+    s >= 85 ? 2 : s >= 75 ? 1 : 1
+
+stateIcon(FVG f) =>
+    f.inverted ? "⇄" : f.state == 2 ? "✓" : f.state == 1 ? "◐" : "✦"
+
+// Live fill color for a gap honoring tier visuals + mitigation state.
+fillColor(FVG f, int effScore) =>
+    if f.inverted
+        colInv
+    else if f.state == 2
+        colTested
+    else if f.state == 1
+        colPartial
+    else
+        base = f.bull ? colBullBase : colBearBase
+        tr = tierVisuals ? tierTransp(effScore) : 74
+        color.new(base, tr)
+
+// ========================= DISPLACEMENT QUALITY ==============================
+// Middle (gap-forming) bar is [1]. Must be a strong, directional displacement.
+dispRange = high[1] - low[1]
+dispBody  = math.abs(close[1] - open[1])
+rangeSafe = math.max(dispRange, syminfo.mintick)
+// close position within the candle range: 1.0 = closed at high (bull) / low (bear)
+closePosBull = (close[1] - low[1]) / rangeSafe
+closePosBear = (high[1] - close[1]) / rangeSafe
+dispBullOK = (close[1] > open[1]) and dispRange >= atr * dispAtrMult and (dispBody / rangeSafe) >= dispBodyPct and closePosBull >= dispClosePct
+dispBearOK = (close[1] < open[1]) and dispRange >= atr * dispAtrMult and (dispBody / rangeSafe) >= dispBodyPct and closePosBear >= dispClosePct
+
+// Consolidation guard: combined range of the 3 forming bars should show expansion.
+threeBarRange = math.max(high, high[1], high[2]) - math.min(low, low[1], low[2])
+notConsolidation = not rejectConsolid or threeBarRange >= atr * consolAtrMult
+
+// ========================= STRUCTURE CONFLUENCE ==============================
+// Sweep must occur within the window immediately BEFORE the displacement bar
+// (bars [2 .. 2+sweepLookback-1] relative to the just-closed detection bar).
 sweptKeyLevel(bool bull) =>
     bool found = false
-    for i = 1 to sweepLookback
+    for i = 2 to 1 + sweepLookback
         hi = high[i]
         lo = low[i]
         cl = close[i]
@@ -132,20 +208,10 @@ sweptKeyLevel(bool bull) =>
                 found := true
     found
 
-// Order/breaker block origin proxy: opposite-color candle right before the
-// displacement candle (bar [2] relative to the just-closed detection bar).
 obOrigin(bool bull) =>
     bull ? (close[2] < open[2]) : (close[2] > open[2])
 
-// Displacement candle = the middle bar [1]. Strong directional candle:
-// range >= ATR mult AND body dominates range AND closes in gap direction.
-dispRange = high[1] - low[1]
-dispBody  = math.abs(close[1] - open[1])
-dispBullOK = (close[1] > open[1]) and dispRange >= atr * dispAtrMult and (dispBody / math.max(dispRange, syminfo.mintick)) >= dispBodyPct
-dispBearOK = (close[1] < open[1]) and dispRange >= atr * dispAtrMult and (dispBody / math.max(dispRange, syminfo.mintick)) >= dispBodyPct
-
 // ========================= FVG DETECTION =====================================
-// Classic 3-candle FVG on bars [2],[1],[0]. Gap defined by bar2 and bar0.
 bullFVG = low > high[2]
 bearFVG = high < low[2]
 
@@ -160,58 +226,45 @@ sizeOkBear = (gapTopBear - gapBotBear) >= atr * minGapAtrMult
 dispOkBull = not requireDisplacement or dispBullOK
 dispOkBear = not requireDisplacement or dispBearOK
 
-newBull = bullFVG and sizeOkBull and dispOkBull
-newBear = bearFVG and sizeOkBear and dispOkBear
+newBull = bullFVG and sizeOkBull and dispOkBull and notConsolidation
+newBear = bearFVG and sizeOkBear and dispOkBear and notConsolidation
 
-// Is a candidate gap nested inside an existing live gap of the same polarity?
 nestedInLive(bool bull, float top, float bot) =>
     bool nested = false
     if dedupeOverlap and array.size(fvgs) > 0
         for i = 0 to array.size(fvgs) - 1
             FVG f = array.get(fvgs, i)
             if f.alive and f.state < 2 and f.bull == bull
-                // candidate largely within existing live zone
                 if top <= f.top and bot >= f.bot
                     nested := true
     nested
 
-computeScore(bool bull, float gapTop, float gapBot) =>
-    int s = 0
-    if (bull and biasBull) or (not bull and biasBear)
-        s := s + wBias
-    if obOrigin(bull)
-        s := s + wOB
-    if sweptKeyLevel(bull)
-        s := s + wSweep
-    // Displacement strength (scaled by how far beyond the ATR threshold it is)
-    dstrength = math.min(1.0, dispRange / (atr * dispAtrMult))
-    s := s + int(wDisp * dstrength)
-    // Displacement volume
-    volFrac = na(volMa) or volMa == 0 ? 0.0 : math.min(1.0, volume[1] / volMa)
-    s := s + int(wVol * volFrac)
-    // Gap size
-    gh = gapTop - gapBot
-    sizeFrac = math.min(1.0, gh / (atr * sizeFullAtr))
-    s := s + int(wSize * sizeFrac)
-    math.min(100, s)
-
-makeLabelText(FVG f, int effScore) =>
-    gr = showGrade ? grade(effScore) : ""
-    sc = showScore ? str.tostring(effScore) : ""
-    base = gr + (gr != "" and sc != "" ? " " : "") + sc
-    tail = f.inverted ? " ·IFVG" : f.state == 2 ? " ·tested" : f.state == 1 ? " ·partial" : ""
-    base + tail
-
 makeFVG(bool bull, float gapTop, float gapBot) =>
     if not nestedInLive(bull, gapTop, gapBot)
-        int sc = computeScore(bull, gapTop, gapBot)
-        if sc >= minScore
-            col = bull ? colBull : colBear
-            bx = box.new(bar_index - 1, gapTop, bar_index, gapBot, border_color=col, bgcolor=col, extend=extendRight ? extend.right : extend.none)
-            lb = (showScore or showGrade) ? label.new(bar_index - 1, gapTop, "", style=bull ? label.style_label_down : label.style_label_up, color=color.new(chart.bg_color, 100), textcolor=colText, size=size.small) : na
-            FVG f = FVG.new(bx, lb, gapTop, gapBot, gapTop, gapBot, bull, sc, bar_index, 0, false, true)
-            if not na(lb)
-                label.set_text(lb, makeLabelText(f, sc))
+        // confluence flags
+        cBias  = (bull and biasBull) or (not bull and biasBear)
+        cMSS   = (bull and mssBull) or (not bull and mssBear)
+        cOB    = obOrigin(bull)
+        cSweep = sweptKeyLevel(bull)
+        int s = 0
+        s := s + (cBias  ? wBias  : 0)
+        s := s + (cMSS   ? wMSS   : 0)
+        s := s + (cOB    ? wOB    : 0)
+        s := s + (cSweep ? wSweep : 0)
+        dstrength = math.min(1.0, dispRange / (atr * dispAtrMult))
+        s := s + int(wDisp * dstrength)
+        volFrac = na(volMa) or volMa == 0 ? 0.0 : math.min(1.0, volume[1] / volMa)
+        s := s + int(wVol * volFrac)
+        gh = gapTop - gapBot
+        sizeFrac = math.min(1.0, gh / (atr * sizeFullAtr))
+        s := s + int(wSize * sizeFrac)
+        s := math.min(100, s)
+        if s >= minScore
+            base = bull ? colBullBase : colBearBase
+            col = color.new(base, tierVisuals ? tierTransp(s) : 74)
+            bw = tierVisuals ? tierBorderW(s) : 1
+            bx = box.new(bar_index - 1, gapTop, bar_index, gapBot, border_color=color.new(base, 20), bgcolor=col, border_width=bw, extend=extendRight ? extend.right : extend.none)
+            FVG f = FVG.new(bx, na, gapTop, gapBot, gapTop, gapBot, bull, s, bar_index, 0, false, true, cBias, cSweep, cMSS, cOB)
             array.push(fvgs, f)
             if array.size(fvgs) > maxActive
                 FVG old = array.shift(fvgs)
@@ -225,7 +278,40 @@ if barstate.isconfirmed
     if newBear
         makeFVG(false, gapTopBear, gapBotBear)
 
-// ========================= MITIGATION UPDATE =================================
+// ========================= LABEL TEXT ========================================
+confluenceTags(FVG f) =>
+    parts = ""
+    if f.cBias
+        parts := parts + "bias "
+    if f.cSweep
+        parts := parts + "sweep "
+    if f.cMSS
+        parts := parts + "MSS "
+    if f.cOB
+        parts := parts + "OB "
+    str.trim(parts)
+
+labelFor(FVG f, int effScore) =>
+    string txt = na
+    g = grade(effScore)
+    if labelMode == "None"
+        txt := na
+    else if labelMode == "Grade only"
+        txt := g
+    else if labelMode == "Minimal tag"
+        txt := g
+    else if labelMode == "Grade + state icon"
+        txt := stateIcon(f) + " " + g
+    else if labelMode == "Grade + score"
+        txt := g + " " + str.tostring(effScore)
+    // append confluence on A-grade only (not for minimal/none)
+    if showConfluence and not na(txt) and labelMode != "Minimal tag" and gradeRank(g) >= 3
+        ct = confluenceTags(f)
+        if ct != ""
+            txt := txt + "  " + ct
+    txt
+
+// ========================= MITIGATION + RENDER ===============================
 useCE = mitThreshold == "Midpoint (CE)"
 
 if barstate.isconfirmed and array.size(fvgs) > 0
@@ -234,20 +320,17 @@ if barstate.isconfirmed and array.size(fvgs) > 0
         if not f.alive
             continue
 
-        ce = (f.origTop + f.origBot) / 2.0   // consequent encroachment (50%)
+        ce = (f.origTop + f.origBot) / 2.0
 
         if not f.inverted
             if f.bull
-                // Bullish gap sits below price; price trades DOWN into it.
                 fullLevel = useCE ? ce : f.origBot
                 if low <= fullLevel
                     f.state := 2
                 else if low < f.origTop
-                    // partial: imbalance consumed from the top down to current low
                     f.state := 1
                     f.top := low
             else
-                // Bearish gap sits above price; price trades UP into it.
                 fullLevel = useCE ? ce : f.origTop
                 if high >= fullLevel
                     f.state := 2
@@ -255,22 +338,18 @@ if barstate.isconfirmed and array.size(fvgs) > 0
                     f.state := 1
                     f.bot := high
         else
-            // Inverted FVG: polarity flipped. Treat the original zone as S/R.
-            // Re-mitigation of an IFVG retires it.
-            if f.bull  // was bullish, now acting as resistance after trade-through
+            if f.bull
                 if high >= f.origTop
                     f.alive := false
-            else       // was bearish, now acting as support
+            else
                 if low <= f.origBot
                     f.alive := false
 
-        // Transition to inverted (IFVG) instead of plain tested, if enabled
         if f.state == 2 and showInversion and not f.inverted
             f.inverted := true
             f.top := f.origTop
             f.bot := f.origBot
 
-        // Handle hide / retire
         if (f.state == 2 and hideMitigated and not showInversion) or not f.alive
             box.delete(f.bx)
             if not na(f.lbl)
@@ -278,22 +357,50 @@ if barstate.isconfirmed and array.size(fvgs) > 0
             array.remove(fvgs, i)
             continue
 
-        // Apply visuals
-        col = colorFor(f)
+        // ---- effective score: mitigation penalty + relevance decay ----
+        int effScore = f.score
+        if f.state == 2 and not f.inverted
+            effScore := math.max(0, effScore - mitPenalty)
+        if decayEnable and f.state == 0 and not f.inverted
+            age = bar_index - f.createdBar
+            ageDecay = math.min(1.0, age / float(decayBars))
+            // distance of price from the gap, normalized by ATR
+            dist = f.bull ? math.max(0.0, low - f.origTop) : math.max(0.0, f.origBot - high)
+            distDecay = atr > 0 ? math.min(1.0, dist / (atr * 10.0)) : 0.0
+            decay = int(decayMaxPts * math.max(ageDecay, distDecay))
+            effScore := math.max(0, effScore - decay)
+
+        // ---- box visuals (tier hierarchy) ----
+        col = fillColor(f, effScore)
         box.set_bgcolor(f.bx, col)
-        box.set_border_color(f.bx, col)
+        baseBorder = f.inverted ? colInv : f.bull ? colBullBase : colBearBase
+        box.set_border_color(f.bx, color.new(baseBorder, 20))
+        if tierVisuals and f.state == 0 and not f.inverted
+            box.set_border_width(f.bx, tierBorderW(effScore))
         box.set_top(f.bx, f.top)
         box.set_bottom(f.bx, f.bot)
         if f.state == 2 and not f.inverted
             box.set_extend(f.bx, extend.none)
             box.set_right(f.bx, bar_index)
 
-        effScore = (f.state == 2 and not f.inverted) ? math.max(0, f.score - mitPenalty) : f.score
-        if not na(f.lbl)
-            label.set_text(f.lbl, makeLabelText(f, effScore))
-            label.set_textcolor(f.lbl, colText)
-            label.set_x(f.lbl, bar_index)
-            label.set_y(f.lbl, f.bull ? f.top : f.bot)
+        // ---- label (clean hierarchy) ----
+        g = grade(effScore)
+        wantLabel = labelMode != "None" and gradeRank(g) >= minGradeRank
+        txt = wantLabel ? labelFor(f, effScore) : na
+        if not na(txt)
+            if na(f.lbl)
+                stl = f.bull ? label.style_label_down : label.style_label_up
+                f.lbl := label.new(bar_index, f.bull ? f.top : f.bot, txt, style=stl, color=color.new(baseBorder, labelMode == "Minimal tag" ? 10 : 100), textcolor=labelMode == "Minimal tag" ? color.white : colText, size=lblSize)
+            else
+                label.set_text(f.lbl, txt)
+                label.set_x(f.lbl, bar_index)
+                label.set_y(f.lbl, f.bull ? f.top : f.bot)
+                label.set_textcolor(f.lbl, labelMode == "Minimal tag" ? color.white : colText)
+                label.set_color(f.lbl, color.new(baseBorder, labelMode == "Minimal tag" ? 10 : 100))
+        else if not na(f.lbl)
+            label.delete(f.lbl)
+            f.lbl := na
+
         array.set(fvgs, i, f)
 
 // ========================= KEY LEVELS ========================================
@@ -303,10 +410,11 @@ plot(showKeyLevels ? pwh : na, "PWH", color=color.new(color.red, 60),   style=pl
 plot(showKeyLevels ? pwl : na, "PWL", color=color.new(color.green, 60), style=plot.style_linebr, linewidth=1)
 
 // ========================= DASHBOARD =========================================
-var table dash = table.new(position.top_right, 2, 5, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+var table dash = table.new(position.top_right, 2, 6, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
 if showDash and barstate.islast
     biasTxt = biasBull ? "Bullish" : biasBear ? "Bearish" : "Neutral"
     biasCol = biasBull ? color.new(color.green, 0) : biasBear ? color.new(color.red, 0) : color.new(color.gray, 0)
+    mssTxt = mssBull ? "Bullish BOS" : mssBear ? "Bearish BOS" : "—"
     int activeCount = 0
     int aGrade = 0
     if array.size(fvgs) > 0
@@ -320,12 +428,14 @@ if showDash and barstate.islast
     table.cell(dash, 1, 0, "", bgcolor=color.new(color.blue, 20))
     table.cell(dash, 0, 1, "Daily Bias", text_color=color.white, text_size=size.small)
     table.cell(dash, 1, 1, biasTxt, text_color=color.white, bgcolor=biasCol, text_size=size.small)
-    table.cell(dash, 0, 2, "Active FVGs", text_color=color.white, text_size=size.small)
-    table.cell(dash, 1, 2, str.tostring(activeCount), text_color=color.white, text_size=size.small)
-    table.cell(dash, 0, 3, "A-grade active", text_color=color.white, text_size=size.small)
-    table.cell(dash, 1, 3, str.tostring(aGrade), text_color=color.white, text_size=size.small)
-    table.cell(dash, 0, 4, "Min score", text_color=color.white, text_size=size.small)
-    table.cell(dash, 1, 4, str.tostring(minScore), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 2, "Structure", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, mssTxt, text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "Active FVGs", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(activeCount), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 4, "A-grade active", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(aGrade), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 5, "Min score", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(minScore), text_color=color.white, text_size=size.small)
 
 // ========================= ALERTS ============================================
 alertcondition(newBull, "New Bullish FVG", "A new bullish Fair Value Gap formed")
